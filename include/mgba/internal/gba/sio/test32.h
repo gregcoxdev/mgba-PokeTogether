@@ -19,6 +19,9 @@ CXX_GUARD_START
 struct GBASIOTest32 {
 	struct GBASIODriver d;
 	Socket socket;          // TCP connection to the bridge/test server (INVALID until connected)
+	uint32_t targetHost;    // CelioServer IP to dial, host byte order (set by the GBA's "SV_" command)
+	uint16_t targetPort;    // CelioServer port to dial (set by "SV_")
+	bool haveTarget;        // true once "SV_" has set targetHost/targetPort; else fall back to 127.0.0.1:9000
 	bool active;            // true between SESSION_OPEN and SESSION_CLOSE; dormant otherwise
 	bool haveReply;         // whether sendValue holds a fresh reply (else GBA gets open bus)
 	uint8_t frameRemaining; // payload words still expected (0 = awaiting a frame header)

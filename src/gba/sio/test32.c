@@ -45,23 +45,28 @@ void GBASIOTest32Create(struct GBASIOTest32* test) {
 	test->d.finishNormal32 = GBASIOTest32FinishNormal32;
 }
 
-// Lazily (re)connect to the bridge server. Returns false if the server isn't up;
-// connect() to localhost fails fast (ECONNREFUSED) so this never stalls.
+// Lazily (re)connect to the CelioServer the GBA selected via "SV_" -- exactly like the real Pico bridge
+// dials the address it was told, instead of a hardwired host. Falls back to 127.0.0.1:9000 only if no SV_
+// has arrived yet. Returns false if the server isn't up (connect() fails fast so this never stalls).
 static bool _ensureConnected(struct GBASIOTest32* test) {
 	struct Address addr;
+	uint16_t port;
 	if (!SOCKET_FAILED(test->socket)) {
 		return true;
 	}
 	addr.version = IPV4;
-	addr.ipv4 = TEST32_HOST;
-	test->socket = SocketConnectTCP(TEST32_PORT, &addr);
+	addr.ipv4 = test->haveTarget ? test->targetHost : TEST32_HOST;
+	port = test->haveTarget ? test->targetPort : TEST32_PORT;
+	test->socket = SocketConnectTCP(port, &addr);
 	if (SOCKET_FAILED(test->socket)) {
-		mLOG(GBA_SIO, WARN, "[test32] connect to 127.0.0.1:%i failed", TEST32_PORT);
+		mLOG(GBA_SIO, WARN, "[test32] connect to %u.%u.%u.%u:%u failed", (addr.ipv4 >> 24) & 0xFF,
+		     (addr.ipv4 >> 16) & 0xFF, (addr.ipv4 >> 8) & 0xFF, addr.ipv4 & 0xFF, port);
 		return false;
 	}
 	SocketSetBlocking(test->socket, false);
 	SocketSetTCPPush(test->socket, true);
-	mLOG(GBA_SIO, INFO, "[test32] connected to 127.0.0.1:%i", TEST32_PORT);
+	mLOG(GBA_SIO, INFO, "[test32] connected to %u.%u.%u.%u:%u", (addr.ipv4 >> 24) & 0xFF,
+	     (addr.ipv4 >> 16) & 0xFF, (addr.ipv4 >> 8) & 0xFF, addr.ipv4 & 0xFF, port);
 	return true;
 }
 
@@ -200,7 +205,10 @@ static bool GBASIOTest32Start(struct GBASIODriver* driver) {
 	if (!test->active) {
 		// Dormant: the game's own NORMAL_32 traffic (link/RFU detection) gets open
 		// bus and is never forwarded. Only our SESSION_OPEN handshake wakes us up.
-		if (word == TEST32_SESSION_OPEN && _ensureConnected(test)) {
+		if (word == TEST32_SESSION_OPEN) {
+			// Open the session WITHOUT connecting yet: the first frame may be the bridge-LOCAL "SV_"
+			// command, which sets the target and needs no server. The TCP connection is made lazily
+			// when a frame is actually forwarded (see _ensureConnected in the frame-complete block).
 			test->active = true;
 			test->frameRemaining = 0;
 			test->respRemaining = 0;
@@ -268,6 +276,35 @@ static bool GBASIOTest32Start(struct GBASIODriver* driver) {
 	// GBA then clocks that many words back via the respRemaining feeder above.
 	{
 		uint32_t contentLen = 0;
+
+		// "SV_" (set-server) is a BRIDGE-LOCAL command, mirroring the Pico firmware: it sets the address
+		// the NEXT frame is forwarded to and drops any existing connection (so the next forward reconnects
+		// to the new target). It is NOT sent to CelioServer -- the server doesn't know it. Reply: 0 words,
+		// which the GBA reads as a valid empty ack (adapter present), and then it proceeds to PU_.
+		if (test->frameFill >= 9 && test->frameData[0] == 'S' && test->frameData[1] == 'V' && test->frameData[2] == '_') {
+			test->targetHost = ((uint32_t) test->frameData[3] << 24) | ((uint32_t) test->frameData[4] << 16)
+			                 | ((uint32_t) test->frameData[5] << 8)  |  (uint32_t) test->frameData[6];
+			test->targetPort = (uint16_t) ((test->frameData[7] << 8) | test->frameData[8]);
+			test->haveTarget = true;
+			_dropConnection(test);          // force a reconnect to the new target on the next forwarded frame
+			test->respWords = 0;
+			test->respRemaining = 0;
+			test->sendValue = 0;            // 0-word reply = empty ack
+			test->haveReply = true;
+			mLOG(GBA_SIO, INFO, "[test32] SV_ -> target %u.%u.%u.%u:%u", test->frameData[3], test->frameData[4],
+			     test->frameData[5], test->frameData[6], test->targetPort);
+			return true;
+		}
+
+		// Any other frame is a CelioServer command (PS_/PU_/...): (re)connect to the SV_-selected target
+		// lazily and forward it. If the server is unreachable, reply empty -- the GBA reads PU_'s empty
+		// reply as "couldn't reach the server".
+		if (!_ensureConnected(test)) {
+			test->sendValue = 0;
+			test->haveReply = true;
+			return true;
+		}
+
 		// Length-prefix the frame so the server can reassemble it even if TCP splits or
 		// coalesces packets over real WiFi/hardware (on localhost it always arrives whole).
 		// Wire format: [lenHi][lenLo][payload...]; payload is the verbatim CelioServer
